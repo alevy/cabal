@@ -78,6 +78,7 @@ import Distribution.Client.Sandbox            (sandboxInit
                                               ,sandboxListSources
                                               ,sandboxHcPkg
                                               ,dumpPackageEnvironment
+                                              ,withSandboxBinDirOnSearchPath
 
                                               ,getSandboxConfigFilePath
                                               ,loadConfigOrSandboxConfig
@@ -94,6 +95,7 @@ import Distribution.Client.Sandbox            (sandboxInit
                                               ,configPackageDB')
 import Distribution.Client.Sandbox.PackageEnvironment
                                               (setPackageDB
+                                              ,sandboxPackageDBPath
                                               ,userPackageEnvironmentFile)
 import Distribution.Client.Sandbox.Timestamp  (maybeAddCompilerTimestampRecord)
 import Distribution.Client.Sandbox.Types      (UseSandbox(..), whenUsingSandbox)
@@ -120,11 +122,14 @@ import Distribution.Simple.Configure
          , ConfigStateFileErrorType(..), localBuildInfoFile
          , getPersistBuildConfig, tryGetPersistBuildConfig )
 import qualified Distribution.Simple.LocalBuildInfo as LBI
-import Distribution.Simple.Program (defaultProgramConfiguration)
+import Distribution.Simple.GHC (ghcGlobalPackageDB)
+import Distribution.Simple.Program (defaultProgramConfiguration, lookupProgram, ghcProgram)
+import Distribution.Simple.Program.Run (getEffectiveEnvironment)
 import qualified Distribution.Simple.Setup as Cabal
 import Distribution.Simple.Utils
-         ( cabalVersion, die, notice, info, topHandler
-         , findPackageDesc, tryFindPackageDesc , rawSystemExit )
+         ( cabalVersion, debug, die, notice, info, topHandler
+         , findPackageDesc, tryFindPackageDesc , rawSystemExit
+         , rawSystemExitWithEnv )
 import Distribution.Text
          ( display )
 import Distribution.Verbosity as Verbosity
@@ -992,13 +997,33 @@ sandboxAction sandboxFlags extraArgs globalFlags = do
 execAction :: ExecFlags -> [String] -> GlobalFlags -> IO ()
 execAction execFlags extraArgs globalFlags = do
   let verbosity = fromFlag (execVerbosity execFlags)
-  (useSandbox, _config) <- loadConfigOrSandboxConfig verbosity globalFlags
+  (useSandbox, config) <- loadConfigOrSandboxConfig verbosity globalFlags
                            mempty
   case extraArgs of
-    (exec:args) -> maybeWithSandboxDirOnSearchPath useSandbox $
-      rawSystemExit verbosity exec args
+    (exec:args) -> do
+      case useSandbox of
+          NoSandbox ->
+              rawSystemExit verbosity exec args
+          (UseSandbox sandboxDir) -> do
+              let configFlags = savedConfigureFlags config
+              (comp, platform, conf) <- configCompilerAux' configFlags
+              withSandboxBinDirOnSearchPath sandboxDir $ do
+                  menv <- newEnv sandboxDir comp platform conf verbosity
+                  case menv of
+                      Just env -> rawSystemExitWithEnv verbosity exec args env
+                      Nothing  -> rawSystemExit        verbosity exec args
     -- Error handling.
     [] -> die $ "Please specify an executable to run"
+  where
+    newEnv sandboxDir comp platform conf verbosity = do
+        let s = sandboxPackageDBPath sandboxDir comp platform
+        case lookupProgram ghcProgram conf of
+            Nothing -> do
+                debug verbosity "sandbox exec only works with GHC"
+                exitFailure
+            Just ghcProg ->  do
+                g <- ghcGlobalPackageDB verbosity ghcProg
+                getEffectiveEnvironment [("GHC_PACKAGE_PATH", Just $ s ++ ":" ++ g)]
 
 -- | See 'Distribution.Client.Install.withWin32SelfUpgrade' for details.
 --
