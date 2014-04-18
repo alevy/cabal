@@ -15,11 +15,12 @@ module Distribution.Client.Init.Heuristics (
     guessPackageName,
     scanForModules,     SourceFileEntry(..),
     neededBuildPrograms,
+    guessMainFileCandidates,
     guessAuthorNameMail,
     knownCategories,
 ) where
 import Distribution.Text         (simpleParse)
-import Distribution.Simple.Setup (Flag(..))
+import Distribution.Simple.Setup (Flag(..), flagToMaybe)
 import Distribution.ModuleName
     ( ModuleName, toFilePath )
 import Distribution.Client.PackageIndex
@@ -39,18 +40,48 @@ import Control.Arrow ( first )
 import Control.Monad ( liftM )
 import Data.Char   ( isAlphaNum, isNumber, isUpper, isLower, isSpace )
 import Data.Either ( partitionEithers )
-import Data.List   ( isPrefixOf )
+import Data.List   ( isInfixOf, isPrefixOf, isSuffixOf, sortBy )
 import Data.Maybe  ( mapMaybe, catMaybes, maybeToList )
-import Data.Monoid ( mempty, mconcat )
+import Data.Monoid ( mempty, mappend, mconcat, )
+import Data.Ord    ( comparing )
 import qualified Data.Set as Set ( fromList, toList )
-import System.Directory ( getDirectoryContents,
+import System.Directory ( getCurrentDirectory, getDirectoryContents,
                           doesDirectoryExist, doesFileExist, getHomeDirectory, )
 import Distribution.Compat.Environment ( getEnvironment )
 import System.FilePath ( takeExtension, takeBaseName, dropExtension,
                          (</>), (<.>), splitDirectories, makeRelative )
 
+import Distribution.Client.Init.Types     ( InitFlags(..) )
 import Distribution.Client.Compat.Process ( readProcessWithExitCode )
 import System.Exit ( ExitCode(..) )
+
+-- | Return a list of candidate main files for this executable: top-level
+-- modules including the word 'Main' in the file name. The list is sorted in
+-- order of preference, shorter file names are preferred. 'Right's are existing
+-- candidates and 'Left's are those that do not yet exist.
+guessMainFileCandidates :: InitFlags -> IO [Either FilePath FilePath]
+guessMainFileCandidates flags = do
+  dir <-
+    maybe getCurrentDirectory return (flagToMaybe $ packageDir flags)
+  files <- getDirectoryContents dir
+  let existingCandidates = filter isMain files
+      -- We always want to give the user at least one default choice.  If either
+      -- Main.hs or Main.lhs has already been created, then we don't want to
+      -- suggest the other; however, if neither has been created, then we
+      -- suggest both.
+      newCandidates =
+        if any (`elem` existingCandidates) ["Main.hs", "Main.lhs"]
+        then []
+        else ["Main.hs", "Main.lhs"]
+      candidates =
+        sortBy (\x y -> comparing (length . either id id) x y
+                        `mappend` compare x y)
+               (map Left newCandidates ++ map Right existingCandidates)
+  return candidates
+
+  where
+    isMain f =    (isInfixOf "Main" f || isInfixOf  "main" f)
+               && (isSuffixOf ".hs" f || isSuffixOf ".lhs" f)
 
 -- | Guess the package name based on the given root directory.
 guessPackageName :: FilePath -> IO P.PackageName
@@ -87,7 +118,7 @@ sfToFileName projectRoot (SourceFileEntry relPath m ext _ _)
   = projectRoot </> relPath </> toFilePath m <.> ext
 
 -- |Search for source files in the given directory
--- and return pairs of guessed haskell source path and
+-- and return pairs of guessed Haskell source path and
 -- module names.
 scanForModules :: FilePath -> IO [SourceFileEntry]
 scanForModules rootDir = scanForModulesIn rootDir rootDir
@@ -252,18 +283,18 @@ darcsEnv :: Enviro -> AuthorGuess
 darcsEnv = maybe mempty nameAndMail . lookup "DARCS_EMAIL"
 
 gitEnv :: Enviro -> AuthorGuess
-gitEnv env = (name, email)
+gitEnv env = (name, mail)
   where
-    name  = maybeFlag "GIT_AUTHOR_NAME" env
-    email = maybeFlag "GIT_AUTHOR_EMAIL" env
+    name = maybeFlag "GIT_AUTHOR_NAME" env
+    mail = maybeFlag "GIT_AUTHOR_EMAIL" env
 
 darcsCfg :: Maybe String -> AuthorGuess
 darcsCfg = maybe mempty nameAndMail
 
 emailEnv :: Enviro -> AuthorGuess
-emailEnv env = (mempty, email)
+emailEnv env = (mempty, mail)
   where
-    email = maybeFlag "EMAIL" env
+    mail = maybeFlag "EMAIL" env
 
 gitCfg :: GitLoc -> IO AuthorGuess
 gitCfg which = do
@@ -298,7 +329,7 @@ maybeReadFile f = do
         then fmap Just $ readFile f
         else return Nothing
 
--- |Get list of categories used in hackage. NOTE: Very slow, needs to be cached
+-- |Get list of categories used in Hackage. NOTE: Very slow, needs to be cached
 knownCategories :: SourcePackageDb -> [String]
 knownCategories (SourcePackageDb sourcePkgIndex _) = nubSet
     [ cat | pkg <- map head (allPackagesByName sourcePkgIndex)
@@ -311,17 +342,17 @@ nameAndMail :: String -> (Flag String, Flag String)
 nameAndMail str
   | all isSpace nameOrEmail = mempty
   | null erest = (mempty, Flag $ trim nameOrEmail)
-  | otherwise  = (Flag $ trim nameOrEmail, Flag email)
+  | otherwise  = (Flag $ trim nameOrEmail, Flag mail)
   where
     (nameOrEmail,erest) = break (== '<') str
-    (email,_)           = break (== '>') (tail erest)
+    (mail,_)            = break (== '>') (tail erest)
 
 trim :: String -> String
 trim = removeLeadingSpace . reverse . removeLeadingSpace . reverse
   where
     removeLeadingSpace  = dropWhile isSpace
 
--- split string at given character, and remove whitespaces
+-- split string at given character, and remove whitespace
 splitString :: Char -> String -> [String]
 splitString sep str = go str where
     go s = if null s' then [] else tok : go rest where
